@@ -52,10 +52,10 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     # The prompt says: ma20_slope = ma20_today - ma20_5days_ago
     df["ma20_slope_5d"] = df["ma20"].diff(5)
     
-    # LLV / HHV
-    df["llv10"] = df["close"].rolling(window=10).min()
-    df["llv20"] = df["close"].rolling(window=20).min()
-    df["hhv20"] = df["close"].rolling(window=20).max()
+    # LLV / HHV (Using Low/High for better precision)
+    df["llv10"] = df["low"].rolling(window=10).min()
+    df["llv20"] = df["low"].rolling(window=20).min()
+    df["hhv20"] = df["high"].rolling(window=20).max()
     
     # Prev HHV/LLV (Shifted) for breakout/support logic
     df["prev_hhv20"] = df["high"].rolling(window=20).max().shift(1)
@@ -79,9 +79,18 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
         df["amt_ma20"] = df["amount"].rolling(window=20).mean()
         
         # cnt_amt_ok_5: count in last 5 days where amount >= 0.80 * base_vol
-        # Changed from 0.65 * amt_ma20 to 0.80 * base_vol to be more robust to outliers
-        amt_ok = (df["amount"] >= 0.80 * df["base_vol"]).astype(int)
-        df["cnt_amt_ok_5"] = amt_ok.rolling(window=5).sum()
+        # FIX 1: Handle NaN correctly. When base_vol is NaN, amt_ok should be NaN.
+        # Use rolling(window=5, min_periods=3).sum() for cnt_amt_ok_5.
+        
+        # Create boolean series where condition is met, but keep NaN where base_vol is NaN
+        condition = df["amount"] >= 0.80 * df["base_vol"]
+        
+        # FIX 1: Treat BOTH base_vol NaN and amount NaN as invalid
+        amt_ok = condition.astype(float)
+        invalid = df["base_vol"].isna() | df["amount"].isna()
+        amt_ok[invalid] = np.nan
+        
+        df["cnt_amt_ok_5"] = amt_ok.rolling(window=5, min_periods=3).sum()
     else:
         df["base_vol"] = np.nan
         df["trial_ratio"] = np.nan
@@ -101,10 +110,34 @@ def base_building_hint(row: pd.Series) -> bool:
     ma20_slope = _get_val(row, "ma20_slope_5d", 0) # Use 5d slope
     close = _get_val(row, "close")
     ma20 = _get_val(row, "ma20")
+    atr14 = _get_val(row, "atr14")
     
+    # FIX: If close is missing, we cannot reliably detect base building
+    if close is None or pd.isna(close):
+        return False
+
     cond1 = (llv10 is not None and llv20 is not None and llv10 >= llv20)
-    cond2 = (abs(ma20_slope) <= 0.02 * close) if close else False # heuristic for "small"
-    cond3 = (close >= ma20 * 0.95) if (close and ma20) else False
+    
+    # Stricter slope check: abs(slope) <= 0.25 * ATR14 (or 0.005 * close if ATR missing)
+    slope_threshold = 0.005 * close if close else 0.05
+    if atr14 is not None:
+        slope_threshold = 0.25 * atr14
+        
+    cond2 = (abs(ma20_slope) <= slope_threshold)
+    
+    # FIX 3: Tighten BASE_BUILDING trigger to reduce noise
+    # close >= ma20 * 0.95 AND ma20_slope is not strongly negative
+    # If ATR14 exists: ma20_slope >= -0.25 * atr14
+    # Else fallback: ma20_slope >= -0.005 * close
+    
+    slope_floor = -0.005 * close if close else -0.05
+    if atr14 is not None:
+        slope_floor = -0.25 * atr14
+        
+    cond3 = False
+    if close and ma20:
+        if close >= ma20 * 0.95 and ma20_slope >= slope_floor:
+            cond3 = True
     
     return cond1 or cond2 or cond3
 
@@ -143,27 +176,41 @@ def base_ready_v2(row: pd.Series, history_df: pd.DataFrame, idx: int) -> Tuple[b
     # C) volume_not_broken
     # cnt_amt_ok_5 >= 4 (if amount exists)
     if pd.notna(row.get("amount")):
-        cnt = _get_val(row, "cnt_amt_ok_5", 0)
-        if cnt < 4:
+        cnt = _get_val(row, "cnt_amt_ok_5")
+        # If cnt is None or NaN (e.g. early history), treat as pass to avoid blocking
+        if cnt is None or pd.isna(cnt):
+            reasons.append("量能数据不足(放行)")
+        elif cnt < 4:
             return False, []
-        reasons.append(f"量能稳健:cnt={cnt}/5")
+        else:
+            reasons.append(f"量能稳健:cnt={cnt}/5")
     else:
         reasons.append("量能缺失(跳过)")
         
-    # D) trial_volume_seen: in last 7 days, exists day where 1.25 <= trial_ratio <= 1.80
+    # D) trial_volume_seen: in last 7 days, exists day where 1.15 <= trial_ratio <= 1.80
     # We need to look back 7 days from current idx
     start_idx = max(0, idx - 6)
     recent_rows = history_df.iloc[start_idx : idx + 1]
     
     trial_seen = False
     max_ratio = 0.0
+    
+    # FIX 2: trial_ratio guard must use *valid sample count*, not window length
     if "trial_ratio" in recent_rows.columns:
         # Filter valid ratios
         valid_ratios = recent_rows["trial_ratio"].dropna()
-        for r in valid_ratios:
-            if 1.25 <= r <= 1.80:
-                trial_seen = True
-            max_ratio = max(max_ratio, r)
+        
+        # If len(valid_ratios) < 3: allow BASE_READY and append reason
+        if len(valid_ratios) < 3:
+            reasons.append("trial_ratio有效样本不足(放行)")
+            # Do NOT return True immediately, just skip the enforcement block below
+            trial_seen = True # Treat as seen to pass the check
+        else:
+            # Only enforce when we have enough samples
+            for r in valid_ratios:
+                if 1.15 <= r <= 1.80:
+                    trial_seen = True
+                max_ratio = max(max_ratio, r)
             
     if not trial_seen:
         # If amount is missing, we might skip this or fail. 
@@ -173,7 +220,9 @@ def base_ready_v2(row: pd.Series, history_df: pd.DataFrame, idx: int) -> Tuple[b
         else:
             return False, []
     else:
-        reasons.append(f"试探抬头:max_ratio={max_ratio:.2f}")
+        # Only append reason if we actually saw a valid ratio (not just skipped)
+        if max_ratio > 0:
+            reasons.append(f"试探抬头:max_ratio={max_ratio:.2f}")
         
     return True, reasons
 
@@ -214,9 +263,9 @@ def momentum_hot(row: pd.Series) -> Tuple[bool, List[str]]:
     prev_hhv20 = _get_val(row, "prev_hhv20")
     trial_ratio = _get_val(row, "trial_ratio", 0)
     
-    # Trigger 1: close > prev_hhv20 AND trial_ratio >= 1.1
-    if close and prev_hhv20 and close > prev_hhv20 and trial_ratio >= 1.1:
-        reasons.append(f"突破确立:C>HHV,ratio={trial_ratio:.2f}")
+    # Trigger 1: close >= prev_hhv20 AND trial_ratio >= 1.1
+    if close and prev_hhv20 and close >= prev_hhv20 and trial_ratio >= 1.1:
+        reasons.append(f"突破确立:C>=HHV,ratio={trial_ratio:.2f}")
         return True, reasons
         
     # Trigger 2: trial_ratio > 1.80
@@ -275,7 +324,10 @@ def update_state(
     cooldown_days: int = 7,
 ) -> Tuple[str, StateMemory, List[str], Dict]:
     
-    today_ts = str(row["ts"])
+    # FIX: Use datetime for robust comparison and standardized string
+    today_dt = pd.to_datetime(row["ts"])
+    today_ts = today_dt.strftime("%Y-%m-%d")
+    
     new_state = prev_state
     reasons = []
     
@@ -295,7 +347,17 @@ def update_state(
 
     # Handle COOLDOWN
     if prev_state == "COOLDOWN":
-        if memory.cooldown_until and today_ts >= memory.cooldown_until:
+        # Compare datetimes
+        in_cooldown = True
+        if memory.cooldown_until:
+            try:
+                cooldown_dt = pd.to_datetime(memory.cooldown_until)
+                if today_dt >= cooldown_dt:
+                    in_cooldown = False
+            except:
+                pass # Keep cooling if parse fails
+        
+        if not in_cooldown:
             new_state = "OFF"
             reasons.append("冷却期结束")
         else:
@@ -304,18 +366,9 @@ def update_state(
     # Handle INVALIDATED -> COOLDOWN
     if prev_state == "INVALIDATED":
         new_state = "COOLDOWN"
-        # Simple date math approximation or just rely on string comparison for next check
-        # For simplicity in this MVP, we won't do complex date math, just assume next day is cooldown
-        # But prompt asks for cooldown_days. 
-        # We'll just set it. Since we are running daily loop, we can't easily add days to string without datetime.
-        # We will rely on the caller or just set a flag. 
-        # Actually, let's try to parse date.
-        try:
-            dt = pd.to_datetime(today_ts)
-            cooldown_dt = dt + pd.Timedelta(days=cooldown_days)
-            memory.cooldown_until = cooldown_dt.strftime("%Y-%m-%d")
-        except:
-            memory.cooldown_until = "9999-12-31"
+        
+        cooldown_target = today_dt + pd.Timedelta(days=cooldown_days)
+        memory.cooldown_until = cooldown_target.strftime("%Y-%m-%d")
             
         return "COOLDOWN", memory, ["进入冷却"], extras
 
@@ -366,7 +419,7 @@ def update_state(
         
     # Update memory for trial ratio seen
     trial_ratio = _get_val(row, "trial_ratio")
-    if trial_ratio and 1.25 <= trial_ratio <= 1.80:
+    if trial_ratio and 1.15 <= trial_ratio <= 1.80:
         memory.ratio_mid_seen_date = today_ts
 
     return new_state, memory, reasons, extras

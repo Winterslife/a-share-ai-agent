@@ -72,3 +72,41 @@ def calc_indicators(bars: List[Bar]) -> Indicators:
         vol_ma20=float(last["vol_ma20"]) if not pd.isna(last["vol_ma20"]) else None,
         vol_ratio_5_20=float(last["vol_ratio_5_20"]) if not pd.isna(last["vol_ratio_5_20"]) else None,
     )
+
+def calc_strategy_metrics(bars: List[Bar]) -> pd.DataFrame:
+    """
+    Calculate specific metrics for strategy backtesting/validation.
+    Returns a DataFrame with the original data plus:
+    - llv_close_10, llv_close_20: Lowest close in last 10/20 days
+    - ma20: 20-day Moving Average of Close
+    - ma20_slope: Daily change in MA20
+    - amt_ma5, amt_ma20: 5/20-day Moving Average of Amount
+    - amt_vol_ratio: amt_ma5 / amt_ma20
+    """
+    if not bars:
+        return pd.DataFrame()
+
+    df = pd.DataFrame([b.model_dump() for b in bars])
+    
+    # Ensure numeric
+    for col in ["open", "high", "low", "close", "volume", "amount"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 1. Close Price Metrics
+    # LLV (Lowest Low Value) - using Close as requested
+    df["llv_close_10"] = df["close"].rolling(window=10).min()
+    df["llv_close_20"] = df["close"].rolling(window=20).min()
+    
+    # MA20 and Slope
+    df["ma20"] = df["close"].rolling(window=20).mean()
+    df["ma20_slope"] = df["ma20"].diff()
+
+    # 2. Amount Metrics
+    df["amt_ma5"] = df["amount"].rolling(window=5).mean()
+    df["amt_ma20"] = df["amount"].rolling(window=20).mean()
+    
+    # Volume Ratio (using Amount)
+    df["amt_vol_ratio"] = df["amt_ma5"] / df["amt_ma20"]
+
+    return df
