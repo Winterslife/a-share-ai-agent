@@ -1,0 +1,17 @@
+[project]
+name = "a_share_agent"
+version = "0.1.0"
+description = "A-Share Trading Agent"
+dependencies = [
+    "akshare",
+    "pandas",
+    "pydantic",
+    "pyyaml",
+    "streamlit",
+    "loguru",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest",
+]
