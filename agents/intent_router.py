@@ -6,9 +6,13 @@ def route_intent(user_query: str) -> str:
     """
     Simple rule-based intent router for user queries.
     """
-    candidate_keywords = ["选股", "机会", "候选", "池", "扫描"]
+    candidate_keywords = ["选股", "机会", "候选", "池", "扫描", "选几个", "潜力"]
     alert_keywords = ["盯盘", "提醒", "预警", "报警"]
     analysis_keywords = ["分析", "怎么看", "策略", "止损", "止盈", "持仓"]
+    market_keywords = ["大盘", "行情", "市场", "环境", "指数", "宽度"]
+
+    if any(kw in user_query for kw in market_keywords):
+        return "market_breadth"
 
     if any(kw in user_query for kw in candidate_keywords):
         return "candidate_pool"
