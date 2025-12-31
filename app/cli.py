@@ -166,7 +166,7 @@ def main():
     candidates_parser.add_argument("--top", type=int, help="Number of top candidates (optional)")
     candidates_parser.add_argument("--lookback", type=int, default=120, help="Lookback period (default: 120)")
     candidates_parser.add_argument("--diversify", type=int, choices=[0, 1], default=0, help="Enforce diversification (0 or 1)")
-    candidates_parser.add_argument("--mode", default="simple", choices=["simple", "fsm"], help="Generation mode (simple/fsm)")
+    candidates_parser.add_argument("--mode", default="simple", choices=["simple", "fsm", "reversal"], help="Generation mode (simple/fsm/reversal)")
 
     # Demo Query command
     demo_parser = subparsers.add_parser("demo_query", help="Demo natural language query")

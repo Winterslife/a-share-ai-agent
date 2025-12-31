@@ -6,6 +6,7 @@ from agents.market_breadth import get_market_regime
 from core.models import now_ts_str
 from tools.market_data import get_bars
 from agents.state_machine import run_fsm_for_ticker
+from agents.fsm_reversal import run_fsm_for_ticker as run_reversal_fsm
 
 def generate_candidate_pool(
     top_n: int | None = None, 
@@ -90,6 +91,57 @@ def generate_candidate_pool(
             # Limit to top_n
             candidates = candidates[:top_n]
             
+        elif mode == "reversal":
+            # Reversal Mode: Scan for bottom reversals
+            # Strategy: Scan a broader range of liquid stocks (Top 300 by turnover)
+            # to find those that are oversold or building a base.
+            # We avoid "Top Gainers" because reversal candidates are often quiet or just starting.
+            
+            if '成交额' in df_filtered.columns:
+                # Take Top 300 by turnover to ensure liquidity and coverage
+                df_scan = df_filtered.sort_values(by='成交额', ascending=False).head(300)
+            else:
+                # Fallback
+                df_scan = df_filtered.head(300)
+                
+            print(f"Scanning {len(df_scan)} stocks with Reversal FSM (Broad Scan)...")
+            
+            for _, row in df_scan.iterrows():
+                ticker = row['代码']
+                try:
+                    bars = get_bars(ticker, lookback=lookback, use_cache=True)
+                    if len(bars) < 60: # Need more history for MA60
+                        continue
+                        
+                    df_bars = pd.DataFrame([b.model_dump() for b in bars])
+                    fsm_result = run_reversal_fsm(df_bars)
+                    state = fsm_result["state"]
+                    
+                    if state in ["BASE_READY", "BREAKOUT_READY"]:
+                        score = 0
+                        if state == "BASE_READY":
+                            score = 70
+                            groups["BASE_READY"] += 1
+                        elif state == "BREAKOUT_READY":
+                            score = 80
+                            groups["BREAKOUT_READY"] += 1
+                            
+                        candidates.append({
+                            "ticker": ticker,
+                            "name": row['名称'],
+                            "price": row['最新价'],
+                            "pct_chg": row['涨跌幅'],
+                            "state": state,
+                            "score_total": score,
+                            "reasons": fsm_result["reasons"],
+                            "extras": fsm_result["extras"]
+                        })
+                except Exception:
+                    continue
+            
+            candidates.sort(key=lambda x: x["score_total"], reverse=True)
+            candidates = candidates[:top_n]
+
         else:
             # Simple mode: Top gainers
             df_sorted = df_filtered.sort_values(by='涨跌幅', ascending=False)
@@ -113,7 +165,7 @@ def generate_candidate_pool(
             },
             "candidates": candidates,
             "count": len(candidates),
-            "groups": groups if mode == "fsm" else None
+            "groups": groups if mode in ["fsm", "reversal"] else None
         }
     except Exception as e:
         return {
